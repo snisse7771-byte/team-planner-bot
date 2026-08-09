@@ -10,8 +10,14 @@ from html import escape
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import BotCommand, Message
+from aiogram.filters import ChatMemberUpdatedFilter, Command, CommandStart, JOIN_TRANSITION
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    ChatMemberUpdated,
+    Message,
+)
 from dotenv import load_dotenv
 
 from ai import parse_natural_task, summarize_messages
@@ -35,6 +41,19 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 GROUP_TYPES = {ChatType.GROUP, ChatType.SUPERGROUP}
+PRIVATE_COMMANDS = [
+    BotCommand(command="addtask", description="Добавить задачу"),
+    BotCommand(command="tasks", description="Показать открытые задачи"),
+    BotCommand(command="done", description="Отметить задачу выполненной"),
+    BotCommand(command="stats", description="Статистика за 7 дней"),
+    BotCommand(command="help", description="Помощь"),
+]
+GROUP_COMMANDS = [
+    *PRIVATE_COMMANDS[:4],
+    BotCommand(command="summarize", description="Резюме последних 20 сообщений"),
+    BotCommand(command="poll", description="Создать голосование"),
+    PRIVATE_COMMANDS[-1],
+]
 
 
 def is_group(message: Message) -> bool:
@@ -65,13 +84,33 @@ async def start(message: Message) -> None:
         )
     else:
         await message.answer(
-            "Добавьте меня в групповой чат. В группе я веду общий список задач, "
-            "напоминаю о дедлайнах, считаю статистику, делаю резюме и голосования."
+            "Командный планировщик готов к работе.\n"
+            "Здесь вы можете создавать и вести свои задачи.\n"
+            "Команды:\n"
+            "/addtask — добавить задачу\n"
+            "/tasks — показать открытые задачи\n"
+            "/done — отметить задачу выполненной\n"
+            "/stats — статистика за 7 дней\n"
+            "/help — помощь\n\n"
+            "Бота также можно добавить в групповой чат для совместной работы команды."
         )
 
 
 @router.message(Command("help"))
 async def help_cmd(message: Message) -> None:
+    if not is_group(message):
+        await message.answer(
+            "Команды:\n"
+            "/addtask Текст | 2026-08-15 18:00\n"
+            "/tasks — открытые задачи\n"
+            "/done 12 — отметить задачу выполненной\n"
+            "/stats — выполненные задачи за 7 дней\n"
+            "/help — помощь\n\n"
+            "Можно также написать задачу обычным текстом, например: "
+            "«Подготовить отчёт к пятнице 18:00»."
+        )
+        return
+
     await message.answer(
         "Команды:\n"
         "/addtask Текст | @username | 2026-08-15 18:00\n"
@@ -86,29 +125,38 @@ async def help_cmd(message: Message) -> None:
 
 @router.message(Command("addtask"))
 async def add_task_cmd(message: Message, bot: Bot) -> None:
-    if not is_group(message):
-        await message.answer("Эта команда предназначена для группового чата.")
-        return
     text = message.text or ""
     args = text.split(maxsplit=1)
     if len(args) < 2:
-        await message.answer("Формат: /addtask Текст | @username | 2026-08-15 18:00")
+        if is_group(message):
+            await message.answer("Формат: /addtask Текст | @username | 2026-08-15 18:00")
+        else:
+            await message.answer("Формат: /addtask Текст | 2026-08-15 18:00")
         return
 
     parts = [p.strip() for p in args[1].split("|")]
-    if len(parts) != 3:
-        await message.answer("Нужно 3 части через |: задача | @username | дата время")
-        return
+    if is_group(message):
+        if len(parts) != 3:
+            await message.answer("Нужно 3 части через |: задача | @username | дата время")
+            return
+        title, assignee_raw, deadline_raw = parts
+        assignee = assignee_raw.lstrip("@") if assignee_raw else None
+    else:
+        if len(parts) != 2:
+            await message.answer("Нужно 2 части через |: задача | дата время")
+            return
+        title, deadline_raw = parts
+        assignee = message.from_user.username
+        user_id = message.from_user.id
 
-    title, assignee_raw, deadline_raw = parts
-    assignee = assignee_raw.lstrip("@") if assignee_raw else None
     try:
         deadline = datetime.strptime(deadline_raw, "%Y-%m-%d %H:%M").astimezone()
     except ValueError:
         await message.answer("Дата должна быть в формате YYYY-MM-DD HH:MM, например 2026-08-15 18:00")
         return
 
-    user_id = await resolve_username_to_user_id(message.chat.id, assignee)
+    if is_group(message):
+        user_id = await resolve_username_to_user_id(message.chat.id, assignee)
     task_id = await add_task(
         message.chat.id,
         title,
@@ -128,8 +176,6 @@ async def add_task_cmd(message: Message, bot: Bot) -> None:
 
 @router.message(Command("tasks"))
 async def tasks_cmd(message: Message) -> None:
-    if not is_group(message):
-        return
     tasks = await list_open_tasks(message.chat.id)
     if not tasks:
         await message.answer("Открытых задач нет.")
@@ -145,8 +191,6 @@ async def tasks_cmd(message: Message) -> None:
 
 @router.message(Command("done"))
 async def done_cmd(message: Message) -> None:
-    if not is_group(message):
-        return
     match = re.search(r"/done(?:@\w+)?\s+(\d+)", message.text or "", flags=re.I)
     if not match:
         await message.answer("Формат: /done 12")
@@ -161,8 +205,6 @@ async def done_cmd(message: Message) -> None:
 
 @router.message(Command("stats"))
 async def stats_cmd(message: Message) -> None:
-    if not is_group(message):
-        return
     rows = await weekly_stats(message.chat.id)
     if not rows:
         await message.answer("За последние 7 дней выполненных задач пока нет.")
@@ -176,6 +218,7 @@ async def stats_cmd(message: Message) -> None:
 @router.message(Command("summarize"))
 async def summarize_cmd(message: Message) -> None:
     if not is_group(message):
+        await message.answer("Эта команда предназначена для группового чата.")
         return
     messages = await last_messages(message.chat.id, 20)
     # Не включаем саму команду в резюме, если она уже успела сохраниться.
@@ -197,6 +240,7 @@ async def summarize_cmd(message: Message) -> None:
 @router.message(Command("poll"))
 async def poll_cmd(message: Message, bot: Bot) -> None:
     if not is_group(message):
+        await message.answer("Эта команда предназначена для группового чата.")
         return
     raw = re.sub(r"^/poll(?:@\w+)?\s*", "", message.text or "", flags=re.I).strip()
     if not raw:
@@ -225,7 +269,7 @@ async def poll_cmd(message: Message, bot: Bot) -> None:
 
 @router.message(F.text)
 async def all_text_messages(message: Message, bot: Bot) -> None:
-    if not is_group(message) or not message.from_user:
+    if not message.from_user:
         return
 
     await upsert_user(
@@ -275,6 +319,9 @@ async def all_text_messages(message: Message, bot: Bot) -> None:
     assignee_user_id = await resolve_username_to_user_id(message.chat.id, assignee)
     if assignee and message.from_user.username and assignee.lower() == message.from_user.username.lower():
         assignee_user_id = message.from_user.id
+    if not is_group(message) and not assignee:
+        assignee = message.from_user.username
+        assignee_user_id = message.from_user.id
 
     task_id = await add_task(
         message.chat.id,
@@ -290,6 +337,26 @@ async def all_text_messages(message: Message, bot: Bot) -> None:
         f"{escape(str(parsed['title']))}\n"
         f"Ответственный: {mention(assignee)}\n"
         f"Дедлайн: {deadline.astimezone().strftime('%d.%m.%Y %H:%M')}"
+    )
+
+
+@router.my_chat_member(
+    ChatMemberUpdatedFilter(JOIN_TRANSITION),
+    F.chat.type.in_(GROUP_TYPES),
+)
+async def bot_added_to_group(event: ChatMemberUpdated) -> None:
+    await event.answer(
+        "Я — командный планировщик.\n"
+        "Помогаю вести задачи и работу команды.\n"
+        "/addtask — добавить задачу\n"
+        "/tasks — открытые задачи\n"
+        "/done — отметить выполненной\n"
+        "/stats — статистика за 7 дней\n"
+        "/summarize — резюме последних сообщений\n"
+        "/poll — создать голосование\n"
+        "/help — помощь\n\n"
+        "Можно также создавать задачи обычным текстом, например:\n"
+        "@username подготовить отчёт к пятнице 18:00"
     )
 
 
@@ -315,16 +382,14 @@ async def reminder_worker(bot: Bot) -> None:
 
 
 async def set_commands(bot: Bot) -> None:
+    await bot.delete_my_commands()
     await bot.set_my_commands(
-        [
-            BotCommand(command="addtask", description="Добавить задачу"),
-            BotCommand(command="tasks", description="Показать открытые задачи"),
-            BotCommand(command="done", description="Отметить задачу выполненной"),
-            BotCommand(command="stats", description="Статистика за 7 дней"),
-            BotCommand(command="summarize", description="Резюме последних 20 сообщений"),
-            BotCommand(command="poll", description="Создать голосование"),
-            BotCommand(command="help", description="Помощь"),
-        ]
+        PRIVATE_COMMANDS,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+    await bot.set_my_commands(
+        GROUP_COMMANDS,
+        scope=BotCommandScopeAllGroupChats(),
     )
 
 
