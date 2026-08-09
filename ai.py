@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -9,6 +10,8 @@ from typing import Any
 
 from google import genai
 
+
+_GENAI_CLIENT: genai.Client | None = None
 
 
 def clean_telegram_text(text: str) -> str:
@@ -30,10 +33,16 @@ def clean_telegram_text(text: str) -> str:
     return text or "Не удалось сформировать резюме."
 
 def _client() -> genai.Client:
+    global _GENAI_CLIENT
+
+    if _GENAI_CLIENT is not None:
+        return _GENAI_CLIENT
+
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
-    return genai.Client(api_key=api_key)
+    _GENAI_CLIENT = genai.Client(api_key=api_key)
+    return _GENAI_CLIENT
 
 
 def _model() -> str:
@@ -54,7 +63,8 @@ async def summarize_messages(messages: list[dict[str, Any]]) -> str:
 Обсуждение:
 {transcript}
 """
-    response = await _client().aio.models.generate_content(
+    response = await asyncio.to_thread(
+        _client().models.generate_content,
         model=_model(),
         contents=prompt,
     )
@@ -78,7 +88,8 @@ async def parse_natural_task(text: str) -> dict[str, Any] | None:
 
 Сообщение: {text}
 """
-    response = await _client().aio.models.generate_content(
+    response = await asyncio.to_thread(
+        _client().models.generate_content,
         model=_model(),
         contents=prompt,
     )
